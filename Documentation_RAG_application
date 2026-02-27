@@ -1,0 +1,97 @@
+# Dokumentáció – Agentic RAG Tanulást Segítő Alkalmazás
+
+## 1. Projekt áttekintés
+
+Ez a notebook egy **Agentic RAG (Retrieval-Augmented Generation)** alapú tanulást segítő chatbot prototípusa. A felhasználó PDF dokumentumokat tölthet fel tárgyak szerint rendezett mappákba, és természetes nyelven kérdezhet, összefoglalót vagy tanulási tervet kérhet belőlük.
+
+A rendszer **agentic** jellegű: nem lineárisan dolgozza fel a kérdéseket, hanem dinamikusan dönt a következő lépésről – visszakérdez ha nem egyértelmű az input, értékeli a saját találatait, web keresést indít ha a dokumentumokban nincs elég információ, és újrapróbálkozik ha a válasz nem elég jó.
+
+---
+
+## 2. Felhasznált technológiák és indoklásuk
+
+### LangGraph
+A pipeline vezérlésére LangGraph-ot használunk. A hagyományos lineáris LangChain lánccal szemben a LangGraph lehetővé teszi a feltételes elágazásokat, visszacsatolási köröket és az állapot perzisztens kezelését – mindez elengedhetetlen az agentic viselkedéshez. A `StateGraph` és `TypedDict` alapú state management biztosítja hogy minden node pontosan tudja mi történt az előző lépésekben.
+
+### Groq API – llama-3.3-70b-versatile
+Ingyenes, nagy kontextusablakú (128k token) LLM API. Nem igényel saját GPU-t, LangChain-en keresztül egy sorban cserélhető más modellre. Mock fallback biztosítja hogy API kulcs nélkül is tesztelhető a pipeline.
+
+### ChromaDB
+Perzisztens vektoros adatbázis. Minden tárgy külön kollekcióba kerül, a chunk metaadatok (tárgy neve, forrás fájl) lehetővé teszik a tárgy szerinti azonosítást. A `PersistentClient` révén az indexelt adatok megmaradnak újraindítás után.
+
+### Sentence Transformers – paraphrase-multilingual-MiniLM-L12-v2
+Ingyenes, lokálisan futó multilinguális embedding modell. 50+ nyelvet támogat, magyarul is megfelelő szemantikus keresési minőséget ad. Kis mérete (~120MB) miatt gyorsan betölthető.
+
+### Tavily
+LLM-ekhez optimalizált ingyenes keresési API (1000 keresés/hó). Strukturált találatokat ad vissza, szemben az általános kereső API-kkal. Csak fallbackként aktiválódik, ha a RAG találatok gyengék.
+
+### PyMuPDF (fitz)
+Gyors és megbízható PDF szövegkinyerő könyvtár. Oldalanként olvassa be a dokumentumokat, és hibás vagy üres PDF esetén értelmes hibaüzenetet ad.
+
+---
+
+## 3. Pipeline részegységek bemutatása
+
+### AppState
+A LangGraph `TypedDict` alapú state tárolja a pipeline összes köztes értékét egy kérdés-válasz körön belül. Fontosabb mezők: `messages` (teljes history), `task_type`, `retrieved_chunks`, `web_search_needed`, `satisfactory`, `retry_count`.
+
+### process_input
+Minden új kérdésnél reseteli a köztes értékeket (chunks, web results, task type stb.), de megőrzi a `messages` history-t a kontextus fenntartásához.
+
+### task_classifier
+LLM dönti el mi a felhasználó szándéka. Négy lehetséges task: `QA`, `SUMMARIZE`, `STUDY_PLAN`, `CLARIFY`. Meghatározza azt is hogy kell-e RAG (`skip_rag`) – köszönések és általános csevegés esetén kihagyja a dokumentumkeresést.
+
+### rag_retriever
+Szemantikus keresés a ChromaDB-ben az összes kollekción egyszerre. Ha több tárgyból is jönnek találatok, `_MULTI` flag kerül a task type-ba, és a válaszban jelzi melyik tárgyból származik az információ, illetve javaslatot tesz ha egy anyag valószínűleg rossz mappában van.
+
+### evaluator
+LLM értékeli a visszakeresett chunkokat. Ha nem relevánsak a kérdéshez, web keresést indít. Ez a node teszi lehetővé hogy a rendszer ne adjon félrevezető választ gyenge RAG találatok alapján.
+
+### web_search
+Tavily keresés, csak akkor fut ha az evaluator gyengének ítélte a RAG találatokat. A találatok karakterszám alapján csonkítva kerülnek a promptba a token limit túllépés elkerülése érdekében.
+
+### llm_node
+Generálja a végső választ. Három kontextus forrást kezel: RAG dokumentumok, web keresés eredménye, vagy egyik sem (saját tudás alapján). Minden esetben kiírja melyik forrást használta.
+
+### postprocess
+Formázza a végső választ. Tanulási terv esetén instrukciót fűz hozzá a folytatáshoz ("Melyik lépést szeretnéd részletesebben?").
+
+### self_eval_node – ReAct loop
+Az LLM megvizsgálja saját válaszát. Ha nem elég jó, átfogalmazza a keresési kifejezést és visszamegy a `rag_retriever`-hez. Maximum 2 újrapróbálkozás engedélyezett, ezután a rendszer a legjobb elérhető választ adja vissza.
+
+---
+
+## 4. Teljesítmény és bottleneck-ek
+
+### Jelenlegi bottleneck-ek
+
+**LLM hívások száma:** Egy kérdés-válasz körben akár 4-5 LLM hívás is történhet – task classifier, evaluator, llm_node, self_eval_node, és retry esetén újabb evaluator + llm_node. Ez lassítja a válaszidőt és Groq rate limit problémát okozhat intenzív használatnál.
+
+**Chunk méret és overlap:** A jelenlegi 500 szó / 50 szó overlap értékek nem optimálisak minden dokumentumtípushoz. Rövid definíciókból álló anyagoknál a chunkok túl nagyok, folyamatos szövegeknél esetleg túl kicsik.
+
+**Embedding CPU-n:** Az embedding modell CPU-n fut, nagy dokumentumkészlet indexelésekor ez szignifikáns lassulást okoz. Javítható lenne API-alapú embeddinggel vagy GPU-s megoldással.
+
+**Kontextus méret:** A history az utolsó 6 üzenetet tartalmazza, hosszú sessionök esetén ez lehet hogy nem elég vagy éppen túl sok.
+
+### Hogyan mérnénk a teljesítményt
+
+- **Válaszidő mérés** node-onként: minden node elején/végén `time.time()` hívással mérhető melyik lépés a leglassabb
+- **Retrieval minőség:** a visszakeresett chunkok distance értékeinek naplózása megmutatja mennyire relevánsak a találatok átlagosan
+- **Self-eval hatékonyság:** retry arány naplózása – ha túl magas, a chunkolás vagy az embedding modell javítandó
+- **Token használat:** Groq API response-ból kiolvasható a token count, ezzel mérhető a prompt méret optimalizálásának hatása
+
+### Fejlesztési javaslatok
+
+**Automatikus chunk méret választás:** Különböző dokumentumtípusokhoz (tankönyv, diasor, összefoglaló) eltérő chunk méret optimális. Egy előfeldolgozó lépés meghatározhatná az ideális méretet az átlagos bekezdéshossz alapján, vagy más embedding modell esetén automatikusan újraszámolná.
+
+**Beszélgetés vektorizálása:** A korábbi kérdések és válaszok ChromaDB-be indexelhetők lennének, így a rendszer a history-ból is tudna keresni – például ha a felhasználó visszautal egy korábbi témára ("mint amit az előbb mondtál a sejtekről"). Ez a LangGraph állapotkezelésével integrálható lenne úgy hogy a `messages` history periodikusan indexelődik.
+
+**RAG hívás tárgy alapján:** Jelenleg a rendszer minden kollekción végigkeres. Ha a task_classifier azonosítja melyik tárgyhoz kapcsolódik a kérdés (az elérhető tárgy mappák listája alapján), a keresés szűkíthető az adott kollekció(k)ra. Ez gyorsabb keresést és pontosabb találatokat eredményezne.
+
+**Streaming válasz:** A Groq API támogatja a streaming outputot, ennek bevezetésével a válasz azonnal megjelenne ahogy generálódik, nem kellene megvárni a teljes választ.
+
+**Értékelési keretrendszer:** Egy tesztkészlet összeállításával (kérdés + elvárt válasz párok) automatizálható lenne a retrieval minőség és a válasz helyességének mérése, így fejlesztések hatása objektívan mérhető.
+**Fejezet alapú keresés:** Jelenleg a rendszer csak szemantikai hasonlóság alapján keres, konkrét fájlnév vagy fejezet hivatkozást nem kezel (pl. "a mechanika.pdf első fejezetéből magyarázd el az impulzust"). Ez két lépésben valósítható meg:
+
+    1. **Indexeléskor** a PyMuPDF-fel azonosíthatók a fejezet határok (regex alapján: "1. fejezet", "Chapter 1", stb.), és a chunk metaadatába elmenthető a fejezet száma és címe a már meglévő `subject` és `source` mezők mellé.
+    2. **Lekérdezéskor** a `task_classifier` vagy egy külön előfeldolgozó LLM hívás azonosítja ha a user konkrét fájlt vagy fejezetet említ, és a ChromaDB `where` szűrőjével csak abból a fájlból / fejezetből keres – a szemantikai keresés pedig ezen a szűkített halmazon fut le.
